@@ -9,12 +9,16 @@ ReAct 智能体 —— 你的第一个"简历级"项目
   2. calculator —— 计算数学表达式
   3. get_time —— 查询当前的北京时间
 
+相比"自由文本 + 正则解析"，本版本使用「结构化输出」：
+要求模型直接返回 JSON，用 json.loads 标准解析，更可靠。
+
 运行方法：
   export DEEPSEEK_API_KEY="sk-你的key"   # 只需设置一次
   source .venv/bin/activate
   python react_agent.py
 """
 
+import json
 import os
 import re
 from openai import OpenAI
@@ -27,23 +31,22 @@ from openai import OpenAI
 SYSTEM_PROMPT = """你是一个智能助手，擅长通过调用工具来一步步解决问题。
 
 # 你可以使用的工具：
-1. get_weather(city="城市名") —— 查询指定城市的实时天气
-2. calculator(expression="数学表达式") —— 计算数学表达式，例如 "123*456"
-3. get_time() —— 查询当前的北京时间（不需要参数）
+1. get_weather —— 查询指定城市的实时天气，参数：city="城市名"
+2. calculator —— 计算数学表达式，参数：expression="数学表达式"，例如 "123*456"
+3. get_time —— 查询当前的北京时间，不需要参数
 
-# 你的回复必须严格遵守以下格式，每次只输出一对 Thought 和 Action：
-Thought: [你的思考过程和下一步计划]
-Action: [你要执行的具体操作]
+# 你的回复必须是一个严格的 JSON 对象，不要输出任何其他文字。格式如下：
 
-# Action 的格式必须是以下两种之一：
-1. 调用工具：工具名(参数名="参数值")
-2. 结束任务：Finish[最终答案]
+调用工具时：
+{"thought": "你的思考过程", "action": "get_weather", "args": {"city": "北京"}}
+
+结束任务时：
+{"thought": "你的思考过程", "action": "Finish", "args": {"answer": "最终答案"}}
 
 # 重要规则：
-- 每次只输出一对 Thought-Action，不要一次输出多个
-- Action 必须写在同一行，不要换行
-- 当你已经收集到足够信息、可以回答用户时，必须用 Finish[最终答案] 结束
+- 只输出 JSON 对象本身，不要用 ```json 包裹，不要有任何多余文字
 - 禁止重复调用同一个工具：如果之前已经调用过并拿到了结果，直接基于已有结果用 Finish 结束
+- 当信息已经足够回答用户时，必须用 action="Finish" 结束
 """
 
 # ════════════════════════════════════════════════════════
@@ -96,55 +99,42 @@ AVAILABLE_TOOLS = {
 
 # ════════════════════════════════════════════════════════
 # 第三部分：解析模型输出
-# 模型输出的是一段文字，我们要从中"抠"出 Thought 和 Action
+# 模型输出的是 JSON，我们用标准解析器 json.loads 直接解析
 # ════════════════════════════════════════════════════════
 
 def parse_output(output: str):
-    """从模型输出中提取 Thought 和 Action"""
-    thought = re.search(r"Thought:\s*(.*?)(?=\n\s*Action:|\Z)", output, re.DOTALL)
-    action = re.search(r"Action:\s*(.*)", output, re.DOTALL)
+    """把模型的 JSON 输出解析成 (thought, action, args)"""
+    # 模型偶尔会输出 ```json ... ``` 或多余文字，先提取花括号部分
+    match = re.search(r"\{.*\}", output, re.DOTALL)
+    if not match:
+        return None, None, None
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None, None, None
+    return data.get("thought", ""), data.get("action", ""), data.get("args", {})
 
-    thought_text = thought.group(1).strip() if thought else "(模型没有写思考过程)"
-    action_text = action.group(1).strip() if action else None
 
-    return thought_text, action_text
-
-
-def execute_action(action_text: str):
-    """解析并执行 Action，返回观察结果（Observation）"""
+def execute_action(action: str, args: dict):
+    """执行结构化的 Action，返回 (状态, 结果)"""
     # 情况1：结束任务
-    if action_text.startswith("Finish"):
-        match = re.match(r"Finish\[(.*)\]", action_text, re.DOTALL)
-        if match:
-            return "FINISHED", match.group(1).strip()
-        return "FINISHED", action_text
+    if action == "Finish":
+        return "FINISHED", args.get("answer", "")
 
-    # 情况2：调用工具，格式如 get_weather(city="北京")
-    tool_match = re.search(r"(\w+)\(", action_text)
-    if not tool_match:
-        return "ERROR", f"无法识别这个 Action 的格式：{action_text}"
-
-    tool_name = tool_match.group(1)
-    args_str = re.search(r"\((.*)\)", action_text, re.DOTALL)
-    args_str = args_str.group(1) if args_str else ""
-
-    # 解析参数，格式如 city="北京" 或 expression="123*456"
-    kwargs = dict(re.findall(r'(\w+)="([^"]*)"', args_str))
-
-    # 查工具注册表，执行对应函数
-    if tool_name not in AVAILABLE_TOOLS:
-        return "ERROR", f"未定义的工具 '{tool_name}'"
+    # 情况2：调用工具
+    if action not in AVAILABLE_TOOLS:
+        return "ERROR", f"未定义的工具 '{action}'"
 
     try:
-        result = AVAILABLE_TOOLS[tool_name](**kwargs)
+        result = AVAILABLE_TOOLS[action](**args)
         return "OBSERVATION", result
     except Exception as e:
-        return "ERROR", f"工具 {tool_name} 执行失败：{e}"
+        return "ERROR", f"工具 {action} 执行失败：{e}"
 
 
 # ════════════════════════════════════════════════════════
 # 第四部分：主循环（智能体的"心跳"）
-# 调模型 → 解析 → 执行工具 → 把结果喂回去 → 循环，直到 Finish
+# 调模型 → 解析 JSON → 执行工具 → 把结果喂回去 → 循环，直到 Finish
 # ════════════════════════════════════════════════════════
 
 def run_agent(user_prompt: str, max_rounds: int = 6):
@@ -181,26 +171,27 @@ def run_agent(user_prompt: str, max_rounds: int = 6):
         # 2. 把模型的回复记入历史
         messages.append({"role": "assistant", "content": output})
 
-        # 3. 解析 Thought 和 Action
-        thought, action_text = parse_output(output)
-        if action_text is None:
-            print("⚠️  没解析到 Action，模型可能没按要求输出，请重试。")
+        # 3. 解析 JSON
+        thought, action, args = parse_output(output)
+        if action is None:
+            print("⚠️  没解析到 JSON，模型可能没按要求输出，请重试。")
             break
 
         # 3.5 【防死循环】检测是否在重复调用同一个工具
-        if action_text not in call_history:
-            call_history.append(action_text)
+        call_key = f"{action}:{sorted(args.items())}"
+        if call_key not in call_history:
+            call_history.append(call_key)
         else:
             print("🔁 检测到重复调用！给模型一个反思提示，而不是再次执行。")
             reflection = (
-                f"⚠️ 你刚才已经调用过 {action_text} 了，结果在之前的 Observation 里。"
-                "请不要重复调用，直接基于已有信息用 Finish[最终答案] 结束。"
+                f"⚠️ 你刚才已经调用过 {action} 工具了，结果在之前的 Observation 里。"
+                "请不要重复调用，直接基于已有信息用 action=Finish 结束。"
             )
             messages.append({"role": "user", "content": f"Observation: {reflection}"})
             continue
 
         # 4. 执行 Action，得到结果
-        status, result = execute_action(action_text)
+        status, result = execute_action(action, args)
 
         if status == "FINISHED":
             print("✅ 任务完成！最终答案：")
