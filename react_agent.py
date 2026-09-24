@@ -43,6 +43,7 @@ Action: [你要执行的具体操作]
 - 每次只输出一对 Thought-Action，不要一次输出多个
 - Action 必须写在同一行，不要换行
 - 当你已经收集到足够信息、可以回答用户时，必须用 Finish[最终答案] 结束
+- 禁止重复调用同一个工具：如果之前已经调用过并拿到了结果，直接基于已有结果用 Finish 结束
 """
 
 # ════════════════════════════════════════════════════════
@@ -163,6 +164,9 @@ def run_agent(user_prompt: str, max_rounds: int = 6):
 
     print(f"👤 用户：{user_prompt}\n" + "=" * 55)
 
+    # 记录已经调用过的工具，用于检测"死循环"
+    call_history = []
+
     for round_num in range(1, max_rounds + 1):
         print(f"\n🔄 第 {round_num} 轮")
 
@@ -182,6 +186,18 @@ def run_agent(user_prompt: str, max_rounds: int = 6):
         if action_text is None:
             print("⚠️  没解析到 Action，模型可能没按要求输出，请重试。")
             break
+
+        # 3.5 【防死循环】检测是否在重复调用同一个工具
+        if action_text not in call_history:
+            call_history.append(action_text)
+        else:
+            print("🔁 检测到重复调用！给模型一个反思提示，而不是再次执行。")
+            reflection = (
+                f"⚠️ 你刚才已经调用过 {action_text} 了，结果在之前的 Observation 里。"
+                "请不要重复调用，直接基于已有信息用 Finish[最终答案] 结束。"
+            )
+            messages.append({"role": "user", "content": f"Observation: {reflection}"})
+            continue
 
         # 4. 执行 Action，得到结果
         status, result = execute_action(action_text)
@@ -206,7 +222,7 @@ def run_agent(user_prompt: str, max_rounds: int = 6):
 # ════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # question = "请帮我查一下北京的天气，顺便算一下 123 乘以 456 等于多少。"
-    question = "现在北京时间是几点？"
+    question = "请帮我查一下北京的天气，顺便算一下 123 乘以 456 等于多少。"
+    # question = "现在北京时间是几点？"
 
     run_agent(question)
