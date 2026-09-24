@@ -1,0 +1,12 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# 敏感信息（API Key 千万不要提交！）
+.env
+*.env
+
+# 系统文件
+.DS_Store
